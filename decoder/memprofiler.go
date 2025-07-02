@@ -75,6 +75,7 @@ func (m *MemProfiler) mallocOverhead(size uint64) uint64 {
 // Each top level object is an entry in a dictionary, and so we have to include
 // the overhead of a dictionary entry
 func (m *MemProfiler) TopLevelObjOverhead(key []byte, expiry int64) uint64 {
+
 	return m.HashtableEntryOverhead() + m.SizeofString(key) + m.RobjOverhead() + m.KeyExpiryOverhead(expiry)
 }
 
@@ -97,6 +98,7 @@ func (m *MemProfiler) SizeofStreamRadixTree(numElements uint64) uint64 {
 	numNodes := uint64(float64(numElements) * 2.5)
 	return 16 * numElements + numNodes * 4 + numNodes * 30 * 8
 }
+
 
 func (m *MemProfiler) StreamOverhead() uint64 {
 	return 2 * pointerSize + 8 + 16 + // stream struct
@@ -156,10 +158,58 @@ func (m *MemProfiler) SkiplistEntryOverhead() uint64 {
 	return m.HashtableEntryOverhead() + 2*pointerSize + 8 + (pointerSize+8)*zsetRandLevel()
 }
 
+func (m *MemProfiler) ListpackEntryOverhead(value []byte) uint64 {
+    var encodingSize, dataSize, backlenSize int
+
+    // 尝试解析为整数
+    if n, err := strconv.ParseInt(string(value), 10, 64); err == nil {
+        // 整数编码：1 字节
+        encodingSize = 1
+        // 数据大小：根据整数范围确定
+        if n >= -128 && n <= 127 {
+            dataSize = 1
+        } else if n >= -32768 && n <= 32767 {
+            dataSize = 2
+        } else if n >= -2147483648 && n <= 2147483647 {
+            dataSize = 4
+        } else {
+            dataSize = 8
+        }
+        // 反向长度：1 字节（整数固定）
+        backlenSize = 1
+    } else {
+        // 字符串编码
+        dataSize = len(value)
+        if dataSize <= 63 {
+            encodingSize = 1
+        } else if dataSize <= 16383 {
+            encodingSize = 2
+        } else {
+            encodingSize = 5
+        }
+        // 反向长度：取决于 entry 总长度
+        entryTotalSize := encodingSize + dataSize
+        if entryTotalSize <= 254 {
+            backlenSize = 1
+        } else {
+            backlenSize = 5
+        }
+    }
+    return uint64(encodingSize + dataSize + backlenSize)
+}
+
+func (m *MemProfiler) ListpackHeaderOverhead() uint64 {
+	return 4 + 2 + 1 
+}
+
 func (m *MemProfiler) QuicklistOverhead(size uint64) uint64 {
 	quicklist := 2 * pointerSize + 8 + 2 * 4
 	quickitem := 4 * pointerSize + 8 + 2 * 4
 	return quicklist + size * quickitem
+}
+
+func (m *MemProfiler) Quicklist2Overhead(size uint64) uint64 {
+	return 3*pointerSize + 8 + 4
 }
 
 func (m *MemProfiler) ZiplistHeaderOverhead() uint64 {
@@ -221,7 +271,7 @@ func (m *MemProfiler) KeyExpiryOverhead(expiry int64) uint64 {
 const LRU_BITS = 24
 
 func (m *MemProfiler) RobjOverhead() uint64 {
-	return pointerSize + 4 + 4 + LRU_BITS + 4
+	return pointerSize + 4 + 4
 }
 
 // SizeofString get memory use of a string
@@ -235,8 +285,17 @@ func (m *MemProfiler) SizeofString(bytes []byte) uint64 {
 		}
 		return 8
 	}
-	l := uint64(len(str))
-	return m.mallocOverhead(l + 8 + 1)
+	size := uint64(len(str))
+	if size < 32 { // 2^5
+		return m.mallocOverhead(size + 1 + 1)
+	} else if size < 256 { // 2^8
+		return m.mallocOverhead(size + 1 + 2  + 1)
+	} else if size < 25536 { // 2^16
+		return m.mallocOverhead(size + 1 + 4 + 1)
+	} else if size < 4294967296 { // 2^32
+		return m.mallocOverhead(size + 1 + 8 + 1)
+	}
+	return m.mallocOverhead(size + 1 + 16 + 1)
 }
 
 // ElemLen get length of a element

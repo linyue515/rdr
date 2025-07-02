@@ -102,8 +102,13 @@ func (d *Decoder) StartStream(key []byte, cardinality, expiry int64, info *rdb.I
 	bytes := d.m.TopLevelObjOverhead(key, expiry)
 	bytes += d.m.StreamOverhead()
 	bytes += d.m.SizeofStreamRadixTree(uint64(cardinality))
-
 	d.currentInfo = info
+	if info.Encoding == "stream_v2" {
+		bytes += 16*2 + 8
+	}
+	if info.SizeOfValue >0 {
+		bytes += uint64(info.SizeOfValue)
+	}
 	d.currentEntry = &Entry{
 		Key:              keyStr,
 		Bytes:            bytes,
@@ -111,21 +116,24 @@ func (d *Decoder) StartStream(key []byte, cardinality, expiry int64, info *rdb.I
 		NumOfElem:        0,
 		LenOfLargestElem: 0,
 	}
+	
 }
 
 func (d *Decoder) Xadd(key, id, listpack []byte) {
 	e := d.currentEntry
+	e.NumOfElem++
 	e.Bytes += d.m.mallocOverhead(uint64(len(listpack)))
 }
 
 func (d *Decoder) EndStream(key []byte, items uint64, lastEntryID string, cgroupsData rdb.StreamGroups) {
 	e := d.currentEntry
-
 	for _, cg := range cgroupsData {
 		pendingLength := uint64(len(cg.Pending))
 		e.Bytes += d.m.SizeofStreamRadixTree(pendingLength)
 		e.Bytes += d.m.StreamNACK(pendingLength)
-
+		if d.currentInfo.Encoding == "stream_v2" {
+			e.Bytes += 8
+		}
 		for _, c := range cg.Consumers {
 			e.Bytes += d.m.StreamConsumer(c.Name)
 			pendingLength := uint64(len(cg.Pending))
@@ -201,6 +209,38 @@ func (d *Decoder) EndHash(key []byte) {
 	d.sendEntry()
 }
 
+// StartSetListPack 专门处理 ListPack 编码的 Set 类型
+func (d *Decoder) StartSetListPack(key []byte, cardinality, expiry int64, info *rdb.Info) {
+	// 创建新的 Entry 用于 Set 类型统计信息
+	bytes := d.m.TopLevelObjOverhead(key, expiry)
+	entry := &Entry{
+		Key:       string(key),
+		Type:      "set",
+		NumOfElem: uint64(cardinality),
+		Bytes:     0, 
+	}
+	
+	// 如果有 info 信息，使用其中的 SizeOfValue
+	if info != nil {
+		entry.Bytes =bytes + uint64(info.SizeOfValue)
+	}
+	
+	// 更新内存使用情况
+	d.usedMem += int64(len(key))
+	if info != nil {
+		d.usedMem += int64(info.SizeOfValue)
+	}
+	
+	// 设置当前处理的 entry
+	d.currentEntry = entry
+	d.currentInfo = info
+	d.count++
+}
+
+
+
+
+
 // StartSet is called at the beginning of a set.
 // Sadd will be called exactly cardinality times before EndSet.
 func (d *Decoder) StartSet(key []byte, cardinality, expiry int64, info *rdb.Info) {
@@ -239,7 +279,7 @@ func (d *Decoder) StartList(key []byte, length, expiry int64, info *rdb.Info) {
 	keyStr := string(key)
 
 	d.currentInfo = info
-	bytes := d.m.TopLevelObjOverhead(key, expiry)
+	bytes := uint64(2*8+2*8+2*4) //list头节点
 
 	//bug here length would be -1 if it is quicklist
 	//bytes += d.m.RobjOverhead() * uint64(length)
@@ -249,10 +289,11 @@ func (d *Decoder) StartList(key []byte, length, expiry int64, info *rdb.Info) {
 		Type:      "list",
 		NumOfElem: 0,
 	}
+
 }
 
 // Rpush is called once for each value in a list.
-func (d *Decoder) Rpush(key, value []byte) {
+func (d *Decoder) Rpush(key, value []byte,NodeEncodings uint64) {
 	//keyStr := string(key)
 	e := d.currentEntry
 	e.NumOfElem++
@@ -260,10 +301,12 @@ func (d *Decoder) Rpush(key, value []byte) {
 	switch d.currentInfo.Encoding {
 	case "quicklist":
 		e.Bytes += d.m.ZiplistEntryOverhead(value)
-
+	case "quicklist2":
+		if NodeEncodings == 1 {
+         e.Bytes += d.m.SizeofString(value)
+		}
 	case "ziplist":
 		e.Bytes += d.m.ZiplistEntryOverhead(value)
-
 	case "linkedlist":
 		sizeInlist := uint64(0)
 		if _, err := strconv.ParseInt(string(value), 10, 32); err != nil {
@@ -289,7 +332,7 @@ func (d *Decoder) Rpush(key, value []byte) {
 }
 
 // EndList is called when there are no more values in a list.
-func (d *Decoder) EndList(key []byte) {
+func (d *Decoder) EndList(key []byte, info *rdb.Info ) {
 	e := d.currentEntry
 
 	switch d.currentInfo.Encoding {
@@ -299,16 +342,23 @@ func (d *Decoder) EndList(key []byte) {
 
 	case "ziplist":
 		e.Bytes += d.m.ZiplistHeaderOverhead()
-
 	case "linkedlist":
 		e.Bytes += d.m.LinkedlistOverhead()
-
+	case "quicklist2":
+		// QuickList2 的开销计算，可能需要考虑 listpack 的开销
+		e.Bytes += d.m.Quicklist2Overhead(d.currentInfo.Zips)
+		if info.SizeOfValue > 0 {
+			e.Bytes += uint64(info.SizeOfValue)
+		}
+		e.Bytes += d.m.ListpackHeaderOverhead() * d.currentInfo.ListPacks
 	default:
 		panic(fmt.Sprintf("unknown encoding:%s", d.currentInfo.Encoding))
 	}
 
 	d.sendEntry()
 }
+
+
 
 // StartZSet is called at the beginning of a sorted set.
 // Zadd will be called exactly cardinality times before EndZSet.
